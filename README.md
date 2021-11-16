@@ -19,8 +19,8 @@ Before uploading, we adjusted the file structure of the project. If you need to 
 **In addition, we have made innovations in other aspects**
 
 * We added ddqn model and integrated ddqn model with dueling dqn model
-* We explore the method of fast training model, which can quickly train convergence in a very short number of training times
-* During the training, we found several interesting agent models. Their strategy is to save life rather than choose to pass the customs. Therefore, such models will never lose the game and continue the game forever while getting high scores.
+* We explore the method of fast training model, which canconverge in a very short number of training times
+* During the training, we found several interesting agent models. Their strategy is to survive rather than choose to pass the game. Therefore, such models will never lose the game and continue the game forever while getting high scores.
 
 ## Stable version using state mechine（not the highest score)
 
