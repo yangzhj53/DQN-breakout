@@ -1,1 +1,1 @@
-Because the number of uploaded models cannot exceed 100, only the last 100 models obtained from training are uploaded
+In order to clone faster, we only uploaded the last 10 models of the training process.
