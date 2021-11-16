@@ -4,7 +4,7 @@ Before uploading, we adjusted the file structure of the project. If you need to 
 
 ## A quick preview of our work
 
-<img src="pic\pic1.png" alt="pic1" style="zoom:100%;" />
+<img src="pic\1.png" alt="pic1" style="zoom:100%;" />
 
 **In this project, we finished these following requirements**
 
