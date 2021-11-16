@@ -24,7 +24,7 @@ Before uploading, we adjusted the file structure of the project. If you need to 
 
 ## Stable version using state mechine（not the highest score)
 
-|<img src="video\breakout.gif" alt="pic1" style="zoom:100%;" /> | <img src="pic\statemachine.drawio.png" alt="statemachine.drawio" style="zoom: 50%;" /> |
+|<img src="video\breakout.gif" alt="pic1" style="zoom:100%;" /> | <img src="pic\statemachine.drawio.png" alt="statemachine.drawio" style="zoom: 30%;" /> |
 | ----------------------- | ------------------------------------------------------------ |
 
 
