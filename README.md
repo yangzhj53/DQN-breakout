@@ -4,7 +4,9 @@ Before uploading, we adjusted the file structure of the project. If you need to 
 
 ## A quick preview of our work
 
-![1](pic\1.png)**In this project, we finished these following requirements**
+![](pic\1.png)
+
+**In this project, we finished these following requirements**
 
 * Boost the training speed using Prioritized Experience Replay :white_check_mark:
 
