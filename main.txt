@@ -1,0 +1,591 @@
+import sys
+sys.path.append('D:\gpt-evaluator-yewenxuan')
+import time
+import os
+import re
+import json
+import threading
+from typing import Text, Tuple, List, Dict, Optional, Union, Any
+from queue import Queue
+import pandas as pd
+import numpy as np
+from string import Formatter
+from concurrent.futures import ThreadPoolExecutor
+
+from utils.request_gpt import gpt_completions_for_message, gpt_completions_for_prompt_with_token
+# from summarization.summarization_cot_eval_prompts import EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4
+# from summarization.summarization_eval_prompts import EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4
+# from summarization.summarization_cot_standard_eval_prompts import EVAL_PROMPT_1, EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4
+from summarization.summarization_cot_standard_eval_prompts_v1 import EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4
+
+from summarization.summarization_cot_eval_refuse_answer_prompts import ANSWER_EVAL_PROMPT_1
+
+from summarization.judge_special_prompt import JUDGE_PROMPT_1
+
+# ALL_PROMPTS = [EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4]
+ALL_PROMPTS = [EVAL_PROMPT_1, EVAL_PROMPT_4]
+
+class GptEvaluator:
+    def process(self, data: Dict) -> Dict:
+
+        if data['task'] == "summarization":
+            if 'evaluation' not in data.keys():
+                data['evaluation'] = {}
+            elif 'evaluation' in data.keys() and not data['evaluation'] and '1' in data['judge']:
+                data["evaluation"] = {_prompt['dimension']: None for _prompt in ALL_PROMPTS}
+
+            for prompt in ALL_PROMPTS:
+                dimension = prompt['dimension']
+                if dimension in data["evaluation"].keys(): # 如果该评分维度已经在之前评分，则跳过
+                    continue
+                content = prompt["prompt"].format_map(data)
+                if len(content) > 2048:
+                    data["evaluation"][dimension] = None
+                    continue
+                messages = [{"role": "user", "content": content}]
+                error_count = 0
+                while True:
+                    if error_count >= 3:
+                        break
+                    try:
+                        gpt_result = gpt_completions_for_prompt_with_token(messages=messages, extra="") # 调用GPT接口
+                        if gpt_result['role'] != "assistant":
+                            raise ValueError("role of the response should be 'assistant'.")
+                        gpt_result = gpt_result['content']
+                        score = extract_score(data=gpt_result, dimension=prompt["dimension"])
+                        data["evaluation"][dimension] = (score, gpt_result,)
+                        error_count = 4
+                    except Exception as e:
+                        # if gpt request fails in one dimension, we cancel the evaluation in all dimensions for this example
+                        print(f"gpt request failed for data {data}, {e}.")
+                        # data["evaluation"] = {_prompt['dimension']: None for _prompt in \
+                        #                     [EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4]}
+                        #                     # [EVAL_PROMPT_1]}
+                        data["evaluation"][dimension] = None
+                        error_count += 1
+                        time.sleep(3)
+
+        return data
+
+    def judge(self, data: Dict) -> Dict:
+        data["judge"] = {}
+        for prompt in [JUDGE_PROMPT_1]:
+            content = prompt["prompt"].format_map(data)
+            if len(content) > 2048:
+                    data["judge"][f"{prompt['dimension']}"] = None
+                    continue
+            messages = [{"role": "user", "content": content}]
+            error_count = 0
+            while True:
+                if error_count >= 3:
+                    # if gpt request fails in one dimension, we cancel the evaluation in all dimensions for this example
+                    data["judge"] = {_prompt['dimension']: None for _prompt in \
+                                        [JUDGE_PROMPT_1]}
+                    return data
+                try:
+                    gpt_result = gpt_completions_for_prompt_with_token(messages=messages, extra="")
+
+                    if gpt_result['role'] != "assistant":
+                        raise ValueError("role of the response should be 'assistant'.")
+                    gpt_result = gpt_result['content']
+                    score = extract_judge(data=gpt_result, dimension=prompt["dimension"])
+                    break
+
+                except Exception as e:
+                    error_count += 1
+                    print(f"gpt request failed for data {data}, {e}.")
+                    time.sleep(3)
+
+
+            data["judge"][f"{prompt['dimension']}"] = score
+        return data
+
+class RefuseAnswerGptEvaluator:
+    def process(self, data: Dict) -> Dict:
+        if data['task'] == "summarization":
+            if '1' in data['judge']: # 无法回答
+                for prompt in [ANSWER_EVAL_PROMPT_1]:
+                # for prompt in [EVAL_PROMPT_1]:
+                    content = prompt["prompt"].format_map(data)
+                    if len(content) > 2048:
+                        data["refused_answer_score"] = None
+                        continue
+                    messages = [{"role": "user", "content": content}]
+                    error_count = 0
+                    while True:
+                        if error_count >= 3:
+                            data["refused_answer_score"] = None
+                            break
+                        try:
+                            gpt_result = gpt_completions_for_prompt_with_token(messages=messages, extra="") # 调用GPT接口
+                            if gpt_result['role'] != "assistant":
+                                raise ValueError("role of the response should be 'assistant'.")
+                            gpt_result = gpt_result['content']
+                            score = extract_score_refused_answer(data=gpt_result)
+                            if score is None:
+                                data["refused_answer_score"] = None
+                            else:
+                                data["refused_answer_score"] = (score, gpt_result,)
+                            break
+                        except Exception as e:
+                            # if gpt request fails in one dimension, we cancel the evaluation in all dimensions for this example
+                            print(f"gpt request failed for data {data}, {e}.")
+                            time.sleep(3)
+                            error_count += 1
+
+            else:
+                data['refused_answer_score'] = None
+        return data
+
+def multiprocess_evaluate_summary_refused_answer(data_list: List[Dict], num_thread: int = 3) -> List[Dict]:
+    def singleprocess(q: Queue, output_q: Queue, evaluator: GptEvaluator):
+        while True:
+            if q.empty():
+                break
+            unit = q.get() # 取出输入队列中的输入
+            result = evaluator.process(unit)
+            output_q.put(result)
+    q = Queue()
+    for data in data_list:
+        q.put(data)
+    result_q = Queue()
+    evaluator = RefuseAnswerGptEvaluator()
+    threads = [threading.Thread(target=singleprocess, args=(q, result_q, evaluator)) for _ in range(num_thread)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return list(result_q.queue)
+
+
+def multiprocess_evaluate_summary(data_list: List[Dict], num_thread: int = 3) -> List[Dict]:
+    def singleprocess(q: Queue, output_q: Queue, evaluator: GptEvaluator):
+        while True:
+            if q.empty():
+                break
+            unit = q.get() # 取出输入队列中的输入
+            # if unit['data']
+            result = evaluator.process(unit)
+            output_q.put(result)
+    q = Queue()
+    for data in data_list:
+        q.put(data)
+    result_q = Queue()
+    evaluator = GptEvaluator()
+    threads = [threading.Thread(target=singleprocess, args=(q, result_q, evaluator)) for _ in range(num_thread)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return list(result_q.queue)
+def multiprocess_judge_special(data_list: List[Dict], num_thread: int = 3) -> List[Dict]:
+    def singleprocess_judge_special(q: Queue, output_q: Queue, evaluator: GptEvaluator):
+        while True:
+            if q.empty():
+                break
+            unit = q.get()
+            result = evaluator.judge(unit)
+            output_q.put(result)
+    q = Queue()
+    for data in data_list:
+        q.put(data)
+    result_q = Queue()
+    evaluator = GptEvaluator()
+    threads = [threading.Thread(target=singleprocess_judge_special, args=(q, result_q, evaluator)) \
+               for _ in range(num_thread)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return list(result_q.queue)
+
+def evaluate_summaries(
+    input_file: Text,
+    limit_num: Optional[int] = None,
+    eval_version = 'v1',
+    thread_num: int = 3,
+    score_sample_time: int = 1
+    ):
+    """
+    Evaluate summarization results from csv file with GPT
+
+    :param input_file: csv input file having 3 columns: "instruction", "prompt", "summary"
+    :param limit_num: limited number of examples for evaluation
+    :param thread_num: number of threads for multiprocessing
+    """
+    start_time = time.time()
+
+    # get examples for evaluation
+    df = pd.read_csv(input_file, dtype="str").fillna("")
+    instructions, articles, summaries, judges = list(df['instruction']), list(df['article']), list(df['summary']), list(df['judge']) # 这里prompt是指最后完成总结任务的prompt，instruction是对任务本身的描述
+    inputs = []
+    assert len(instructions) == len(articles) == len(summaries)
+
+    for i in range(len(instructions)):
+        instruction = instructions[i]
+        article = articles[i]
+        summary = summaries[i]
+        judge = judges[i]
+        # if "总结" in instruction: # 只筛选"总结"任务给GPT完成
+        article = article.strip().strip(instruction).strip()
+        inputs.append({"instruction": instruction, "article": article, "summary": summary, "task": "summarization", "id": i, 'judge': judge})
+    if limit_num is not None:
+        inputs = inputs[:limit_num]
+
+    score_record = {} # {'dimension_i': [[sample_1_score_1, sample_1_score_2, ...], [sample_2_score_1, sample_2_score_2, ...]]}
+    # 初始化score_record
+    dimensions = []
+    for prompt in ALL_PROMPTS:
+        dimension = prompt['dimension'] + '_score' #任务相关性_score 语言流畅度_score
+        dimensions.append(dimension)
+        score_record[dimension] = []
+        for i in range(score_sample_time):
+            score_record[dimension].append([])
+    
+    for i in range(score_sample_time):
+        refused_answer_results = multiprocess_evaluate_summary_refused_answer(inputs, num_thread=thread_num)
+        for result in refused_answer_results:
+            refused_answer_score = result['refused_answer_score']
+            if refused_answer_score is None:
+                result['evaluation'] = {}
+                continue
+            if refused_answer_score[0] == 0:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (1, '0，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的')
+                result['evaluation']['任务指令相关性'] = (
+                3, "1，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的")
+                result['evaluation']['文章内容相关性'] = (
+                1, "1，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的")
+            elif refused_answer_score[0] == 1:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (
+                1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+                result['evaluation']['任务指令相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+                result['evaluation']['文章内容相关性'] = (
+                1, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+            elif refused_answer_score[0] == 2:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (
+                1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+                result['evaluation']['任务指令相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+                result['evaluation']['文章内容相关性'] = (
+                2, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+            elif refused_answer_score[0] == 3:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (
+                1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+                result['evaluation']['任务指令相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+                result['evaluation']['文章内容相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+            elif refused_answer_score[0] == 4:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (
+                1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+                result['evaluation']['任务指令相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+                result['evaluation']['文章内容相关性'] = (
+                4, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+            elif refused_answer_score[0] == 5:
+                result['evaluation'] = {}
+                result['evaluation']['事实正确性'] = (
+                1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+                result['evaluation']['任务指令相关性'] = (
+                3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+                result['evaluation']['文章内容相关性'] = (
+                4, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+        results = multiprocess_evaluate_summary(refused_answer_results, num_thread=thread_num)
+
+        # sort result
+        results = sorted(results, key=lambda x: x['id']) 
+        ALL_DIMENSIONS = [prompt["dimension"] for prompt in ALL_PROMPTS]
+        for result in results:
+            evaluation: Dict = result.pop('evaluation')
+            # if None in evaluation.values():
+            #     for dimension in dimensions:
+            #     # for dimension in evaluation.keys():
+            #         score_record[dimension].append(-1)
+            #     # continue
+            for dimension in evaluation.keys():
+                # result[dimension] = evaluation[dimension][1]
+
+                #  skip dimensions we don't want to output
+                if dimension not in ALL_DIMENSIONS:
+                    continue
+
+                dimension_score = f"{dimension}_score"
+                # if dimension_score not in score_record:
+                #     score_record[dimension_score] = []
+
+                if evaluation[dimension] is None:
+                    score_record[dimension_score][i].append(-1)
+                    # result[dimension_score] = 0
+                    pass
+                else:
+                    if evaluation[dimension][0] is not None:
+                        score_record[dimension_score][i].append(float(evaluation[dimension][0]))
+                        # result[dimension_score] = evaluation[dimension][0]
+                    # else:
+                    #     score_record[dimension_score].append(0.)
+                    #     result[dimension_score] = 0
+
+
+
+# >> >>>>>>>>>>>
+    #
+    #
+    #
+    # # refused_answer_results = inputs
+    # # multiprocess refused answer evaluation
+    # refused_answer_results = multiprocess_evaluate_summary_refused_answer(inputs, num_thread=thread_num)
+    # # exit()
+    # for result in refused_answer_results:
+    #     refused_answer_score = result['refused_answer_score']
+    #     if refused_answer_score is None:
+    #         result['evaluation'] = {}
+    #         continue
+    #     if refused_answer_score[0] == 0:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '0，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的')
+    #         result['evaluation']['任务指令相关性'] = (3, "1，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的")
+    #         result['evaluation']['文章内容相关性'] = (1, "1，回答只有”无法回答“之类的提示，没有说明原因，结合文章，实际是可回答的")
+    #     elif refused_answer_score[0] == 1:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+    #         result['evaluation']['任务指令相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #         result['evaluation']['文章内容相关性'] = (1, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #     elif refused_answer_score[0] == 2:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+    #         result['evaluation']['任务指令相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #         result['evaluation']['文章内容相关性'] = (2, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #     elif refused_answer_score[0] == 3:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+    #         result['evaluation']['任务指令相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #         result['evaluation']['文章内容相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #     elif refused_answer_score[0] == 4:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+    #         result['evaluation']['任务指令相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #         result['evaluation']['文章内容相关性'] = (4, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #     elif refused_answer_score[0] == 5:
+    #         result['evaluation'] = {}
+    #         result['evaluation']['事实正确性'] = (1, '1，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答')
+    #         result['evaluation']['任务指令相关性'] = (3, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #         result['evaluation']['文章内容相关性'] = (4, "4，回答只有”无法回答“之类的提示，没有说明原因，结合文章（含没有文章的情况），实际的确无法回答")
+    #
+    # # multiprocess evaluation
+    # results = multiprocess_evaluate_summary(refused_answer_results, num_thread=thread_num)
+    # score_record = {}
+    #
+    # # sort result
+    # results = sorted(results, key=lambda x: x['id'])
+    # for result in results:
+    #     result.pop('id')
+    #
+    # # collect results and scores
+    # # dimensions = []
+    # # for prompt in [EVAL_PROMPT_1, EVAL_PROMPT_2, EVAL_PROMPT_3, EVAL_PROMPT_4]:
+    # #     dimensions.append(prompt['dimension'] + '_score')
+    # # evaluations = []
+    # ALL_DIMENSIONS = [prompt["dimension"] for prompt in ALL_PROMPTS]
+    # for result in results:
+    #     evaluation: Dict = result.pop('evaluation')
+    #     # if None in evaluation.values():
+    #     #     for dimension in dimensions:
+    #     #     # for dimension in evaluation.keys():
+    #     #         score_record[dimension].append(-1)
+    #     #     # continue
+    #     for dimension in evaluation.keys():
+    #         # result[dimension] = evaluation[dimension][1]
+    #
+    #         #  skip dimensions we don't want to output
+    #         if dimension not in ALL_DIMENSIONS:
+    #             continue
+    #
+    #         dimension_score = f"{dimension}_score"
+    #         if dimension_score not in score_record:
+    #             score_record[dimension_score] = []
+    #
+    #         if evaluation[dimension] is None:
+    #             score_record[dimension_score].append(0.)
+    #             result[dimension_score] = 0
+    #         else:
+    #             if evaluation[dimension][0] is None:
+    #                 score_record[dimension_score].append(0.)
+    #                 result[dimension_score] = 0
+    #             else:
+    #                 score_record[dimension_score].append(float(evaluation[dimension][0]))
+    #                 result[dimension_score] = evaluation[dimension][0]
+
+# >>>>>>>>> yewenxuan
+
+    # # calculate mean and variance
+    # names, means, vars = [], [], []
+    # for key in score_record:
+    #     names.append(key)
+    #
+    #     arr = np.array(score_record[key]) # (sample_time, num_summary)
+    #     if -1 in arr:
+    #         raise ValueError(f'{key}得分存在负数')
+    #     # val_arr = []
+    #     # for a in arr:
+    #     #     if a < 0:
+    #     #         continue
+    #     #     val_arr.append(a)
+    #     # val_arr = np.array(val_arr)
+    #     val_arr = arr.mean(axis=0)
+    #     means.append(np.mean(val_arr))
+    #     vars.append(np.var(val_arr))
+
+
+    # output result to file
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    output_dir = os.path.join(current_dir, "output")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    # eval_output_name = input_file.split("/")[-1].rstrip(".csv") + f"_evaluation_{eval_version}.csv"
+    # stats_output_name = input_file.split("/")[-1].rstrip(".csv") + f"_statistics_{eval_version}.csv"
+    scores_output_name = input_file.split("/")[-1].rstrip(".csv") + f"_scores_{eval_version}.csv"
+    # eval_output_path = os.path.join(output_dir, eval_output_name)
+    # stats_output_path = os.path.join(output_dir, stats_output_name)
+    scores_output_path = os.path.join(output_dir, scores_output_name)
+    # df_output = pd.DataFrame.from_records(results)
+    # df_output.to_csv(eval_output_path, index=False, encoding='utf-8')
+    # df_stats = pd.DataFrame({"指标": names, "均值": means, "方差": vars})
+    # df_stats.to_csv(stats_output_path, index=False, encoding='utf-8')
+    df_scores = pd.DataFrame()
+    for k in score_record.keys():
+        output_scores = []
+        score_k_np = np.array(score_record[k]).transpose()
+        for scores in score_k_np:
+            if -1 in scores:
+                output_scores.append(0)
+            else:
+                output_scores.append(scores.mean())  #计算均值
+        df_scores[k] = output_scores
+    df_scores.to_csv(scores_output_path, index=False, encoding='utf-8')
+
+    print(f"process time: {time.time() - start_time} seconds")
+
+def judge_special(input_file: Text, output_file: Text, limit_num: Optional[int] = None, thread_num: int = 3):
+    """
+    Evaluate summarization results from csv file with GPT
+
+    :param input_file: csv input file having 3 columns: "instruction", "prompt", "summary"
+    :param limit_num: limited number of examples for evaluation
+    :param thread_num: number of threads for multiprocessing
+    """
+    start_time = time.time()
+
+    # get examples for evaluation
+    df = pd.read_csv(input_file, dtype="str").fillna("")
+    instructions, articles, summaries = list(df['instruction']), list(df['article']), list(df['summary']) # 这里prompt是指最后完成总结任务的prompt，instruction是对任务本身的描述
+    inputs = []
+    assert len(instructions) == len(articles) == len(summaries)
+
+    for i in range(len(instructions)):
+        instruction = instructions[i]
+        article = articles[i]
+        summary = summaries[i]
+        # if "总结" in instruction: # 只筛选"总结"任务给GPT完成
+        article = article.strip().strip(instruction).strip()
+        inputs.append({"instruction": instruction, "article": article, "summary": summary, "task": "summarization", "id": i})
+    if limit_num is not None:
+        inputs = inputs[:limit_num]
+
+    # multiprocess evaluation
+    results = multiprocess_judge_special(inputs, num_thread=thread_num)
+
+    # sort result
+    results = sorted(results, key=lambda x: x['id'])
+    for result in results:
+        result.pop('id')
+
+    # collect results and scores
+    for result in results:
+        judge: Dict = result['judge']
+        if None in judge.values():
+            result['judge'] = None
+
+    df_output = pd.DataFrame.from_records(results)
+    df_output.to_csv(output_file, index=False, encoding='utf-8')
+    # assert len(instructions) == len(articles) == len(summaries) == len(judges)
+
+    print(f"process time: {time.time() - start_time} seconds")
+
+def extract_score(data: Text, dimension: Text):
+    # pattern = re.compile(f"{{\"{dimension}\":\s*\d}}")
+    pattern = re.compile(r"\d")
+    output = pattern.findall(data)
+    if len(output) > 0:
+        try:
+            score = json.loads(output[-1])
+            # score = int(score[f"{dimension}"])
+            return score
+        except Exception as e:
+            print(f"failed to parse {data}, {e}.")
+    return output
+
+
+def extract_score_refused_answer(data: Text):
+    '''Extract score of refused answer. the score's format is '（0）' / '（1）'.
+    '''
+    pattern = re.compile(r"（\d+）")
+    output = pattern.search(data)
+    score = None
+    if output is not None:
+        try:
+            score = output.group(0)
+            if score == '（0）':
+                score = 0
+            elif score == '（1）':
+                score = 1
+            elif score == '（2）':
+                score = 2
+            elif score == '（3）':
+                score = 3
+            elif score == '（4）':
+                score = 4
+            elif score == '（5）':
+                score = 5
+            else:
+                raise ValueError("refused answer score should be '（0）' or '（1）'")
+            # score = int(score[f"{dimension}"])
+
+        except Exception as e:
+            print(f"failed to parse {data}, {e}.")
+    return score
+
+def extract_judge(data: Text, dimension: Text):
+    pattern = re.compile(f"{{\"{dimension}\":\s*\d}}")
+    output = pattern.search(data)
+    if output is not None:
+        try:
+            score = json.loads(output.group(0))
+            return score
+        except Exception as e:
+            print(f"failed to parse {data}, {e}.")
+            output = None
+    return output
+
+
+
+if __name__ == '__main__':
+    # # 判断是否属于特殊情况
+    # judge_special(input_file="../data/test_chatglm_finetune_epoch6_lr1e-5.csv",
+    #               output_file="../data/test_chatglm_finetune_epoch6_lr1e-5_judge.csv",
+    #               limit_num=None,
+    #               thread_num=10)
+
+
+    # gpt评分
+    evaluate_summaries(input_file="../data/test_chatglm_finetune_epoch6_lr1e-5_judge.csv",
+                       limit_num=None,
+                       eval_version='v2',
+                       thread_num=20,
+                       score_sample_time=5)
+
